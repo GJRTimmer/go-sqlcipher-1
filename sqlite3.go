@@ -729,6 +729,11 @@ func (rc *SQLiteRows) DeclTypes() []string {
 	return rc.decltype
 }
 
+func (rc *SQLiteRows) ColumnTypeDatabaseTypeName(index int) string {
+	typs := rc.DeclTypes()
+	return typs[index]
+}
+
 // Next move cursor to next.
 func (rc *SQLiteRows) Next(dest []driver.Value) error {
 	rv := C.sqlite3_step(rc.s.s)
