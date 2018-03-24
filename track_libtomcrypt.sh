@@ -14,6 +14,7 @@ cp -f $ltd/src/headers/tomcrypt_argchk.h .
 cp -f $ltd/src/headers/tomcrypt_cfg.h .
 cp -f $ltd/src/headers/tomcrypt_cipher.h .
 cp -f $ltd/src/headers/tomcrypt_custom.h .
+gsed -i '12a#define LTC_SOURCE' ./tomcrypt_custom.h
 cp -f $ltd/src/headers/tomcrypt.h .
 cp -f $ltd/src/headers/tomcrypt_hash.h .
 cp -f $ltd/src/headers/tomcrypt_mac.h .
@@ -26,6 +27,7 @@ cp -f $ltd/src/headers/tomcrypt_prng.h .
 
 # copy C files
 cp -f $ltd/src/ciphers/aes/aes.c .
+gsed -i 's/aes_tab.c/aes_tab.h/g' ./aes.c
 cp -f $ltd/src/ciphers/aes/aes_tab.c aes_tab.h
 cp -f $ltd/src/misc/burn_stack.c .
 cp -f $ltd/src/modes/cbc/cbc_decrypt.c .
@@ -43,6 +45,7 @@ cp -f $ltd/src/misc/crypt/crypt_prng_descriptor.c .
 cp -f $ltd/src/misc/crypt/crypt_register_cipher.c .
 cp -f $ltd/src/misc/crypt/crypt_register_hash.c .
 cp -f $ltd/src/misc/crypt/crypt_register_prng.c .
+cp -f $ltd/src/misc/compare_testvector.c .
 cp -f $ltd/src/prngs/fortuna.c .
 cp -f $ltd/src/hashes/helper/hash_memory.c .
 cp -f $ltd/src/mac/hmac/hmac_done.c .
