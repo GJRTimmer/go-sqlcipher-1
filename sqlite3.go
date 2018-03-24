@@ -1,3 +1,5 @@
+// +build cgo
+
 // Copyright (C) 2014 Yasuhiro Matsumoto <mattn.jp@gmail.com>.
 //
 // Use of this source code is governed by an MIT-style
@@ -7,7 +9,8 @@ package sqlite3
 
 /*
 #cgo CFLAGS: -std=gnu99
-#cgo CFLAGS: -DSQLITE_ENABLE_RTREE -DSQLITE_THREADSAFE
+#cgo CFLAGS: -DSQLITE_ENABLE_RTREE -DSQLITE_THREADSAFE=1 -DHAVE_USLEEP=1
+#cgo linux CFLAGS: -DHAVE_PREAD64=1 -DHAVE_PWRITE64=1
 #cgo CFLAGS: -DSQLITE_ENABLE_FTS3 -DSQLITE_ENABLE_FTS3_PARENTHESIS -DSQLITE_ENABLE_FTS4_UNICODE61
 #cgo CFLAGS: -DSQLITE_TRACE_SIZE_LIMIT=15
 #cgo CFLAGS: -DSQLITE_DISABLE_INTRINSIC
@@ -73,22 +76,79 @@ _sqlite3_step(sqlite3_stmt* stmt, long long* rowid, long long* changes)
   return rv;
 }
 
+void _sqlite3_result_text(sqlite3_context* ctx, const char* s) {
+  sqlite3_result_text(ctx, s, -1, &free);
+}
+
+void _sqlite3_result_blob(sqlite3_context* ctx, const void* b, int l) {
+  sqlite3_result_blob(ctx, b, l, SQLITE_TRANSIENT);
+}
+
+
+int _sqlite3_create_function(
+  sqlite3 *db,
+  const char *zFunctionName,
+  int nArg,
+  int eTextRep,
+  uintptr_t pApp,
+  void (*xFunc)(sqlite3_context*,int,sqlite3_value**),
+  void (*xStep)(sqlite3_context*,int,sqlite3_value**),
+  void (*xFinal)(sqlite3_context*)
+) {
+  return sqlite3_create_function(db, zFunctionName, nArg, eTextRep, (void*) pApp, xFunc, xStep, xFinal);
+}
+
+void callbackTrampoline(sqlite3_context*, int, sqlite3_value**);
+void stepTrampoline(sqlite3_context*, int, sqlite3_value**);
+void doneTrampoline(sqlite3_context*);
+
+int compareTrampoline(void*, int, char*, int, char*);
+int commitHookTrampoline(void*);
+void rollbackHookTrampoline(void*);
+void updateHookTrampoline(void*, int, char*, char*, sqlite3_int64);
+
+#ifdef SQLITE_LIMIT_WORKER_THREADS
+# define _SQLITE_HAS_LIMIT
+# define SQLITE_LIMIT_LENGTH                    0
+# define SQLITE_LIMIT_SQL_LENGTH                1
+# define SQLITE_LIMIT_COLUMN                    2
+# define SQLITE_LIMIT_EXPR_DEPTH                3
+# define SQLITE_LIMIT_COMPOUND_SELECT           4
+# define SQLITE_LIMIT_VDBE_OP                   5
+# define SQLITE_LIMIT_FUNCTION_ARG              6
+# define SQLITE_LIMIT_ATTACHED                  7
+# define SQLITE_LIMIT_LIKE_PATTERN_LENGTH       8
+# define SQLITE_LIMIT_VARIABLE_NUMBER           9
+# define SQLITE_LIMIT_TRIGGER_DEPTH            10
+# define SQLITE_LIMIT_WORKER_THREADS           11
+# else
+# define SQLITE_LIMIT_WORKER_THREADS           11
+#endif
+
+static int _sqlite3_limit(sqlite3* db, int limitId, int newLimit) {
+#ifndef _SQLITE_HAS_LIMIT
+  return -1;
+#else
+  return sqlite3_limit(db, limitId, newLimit);
+#endif
+}
 */
 import "C"
 import (
+	"context"
 	"database/sql"
 	"database/sql/driver"
 	"errors"
 	"fmt"
 	"io"
 	"net/url"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
-
-	"golang.org/x/net/context"
 )
 
 // SQLiteTimestampFormats is timestamp formats understood by both this module
@@ -121,6 +181,12 @@ func Version() (libVersion string, libVersionNumber int, sourceID string) {
 	return libVersion, libVersionNumber, sourceID
 }
 
+const (
+	SQLITE_DELETE = C.SQLITE_DELETE
+	SQLITE_INSERT = C.SQLITE_INSERT
+	SQLITE_UPDATE = C.SQLITE_UPDATE
+)
+
 // SQLiteDriver implement sql.Driver.
 type SQLiteDriver struct {
 	ConnectHook func(*SQLiteConn) error
@@ -128,9 +194,12 @@ type SQLiteDriver struct {
 
 // SQLiteConn implement sql.Conn.
 type SQLiteConn struct {
-	db     *C.sqlite3
-	loc    *time.Location
-	txlock string
+	mu          sync.Mutex
+	db          *C.sqlite3
+	loc         *time.Location
+	txlock      string
+	funcs       []*functionInfo
+	aggregators []*aggInfo
 }
 
 // SQLiteTx implemen sql.Tx.
@@ -140,6 +209,7 @@ type SQLiteTx struct {
 
 // SQLiteStmt implement sql.Stmt.
 type SQLiteStmt struct {
+	mu     sync.Mutex
 	c      *SQLiteConn
 	s      *C.sqlite3_stmt
 	t      string
@@ -160,7 +230,109 @@ type SQLiteRows struct {
 	cols     []string
 	decltype []string
 	cls      bool
+	closed   bool
 	done     chan struct{}
+}
+
+type functionInfo struct {
+	f                 reflect.Value
+	argConverters     []callbackArgConverter
+	variadicConverter callbackArgConverter
+	retConverter      callbackRetConverter
+}
+
+func (fi *functionInfo) Call(ctx *C.sqlite3_context, argv []*C.sqlite3_value) {
+	args, err := callbackConvertArgs(argv, fi.argConverters, fi.variadicConverter)
+	if err != nil {
+		callbackError(ctx, err)
+		return
+	}
+
+	ret := fi.f.Call(args)
+
+	if len(ret) == 2 && ret[1].Interface() != nil {
+		callbackError(ctx, ret[1].Interface().(error))
+		return
+	}
+
+	err = fi.retConverter(ctx, ret[0])
+	if err != nil {
+		callbackError(ctx, err)
+		return
+	}
+}
+
+type aggInfo struct {
+	constructor reflect.Value
+
+	// Active aggregator objects for aggregations in flight. The
+	// aggregators are indexed by a counter stored in the aggregation
+	// user data space provided by sqlite.
+	active map[int64]reflect.Value
+	next   int64
+
+	stepArgConverters     []callbackArgConverter
+	stepVariadicConverter callbackArgConverter
+
+	doneRetConverter callbackRetConverter
+}
+
+func (ai *aggInfo) agg(ctx *C.sqlite3_context) (int64, reflect.Value, error) {
+	aggIdx := (*int64)(C.sqlite3_aggregate_context(ctx, C.int(8)))
+	if *aggIdx == 0 {
+		*aggIdx = ai.next
+		ret := ai.constructor.Call(nil)
+		if len(ret) == 2 && ret[1].Interface() != nil {
+			return 0, reflect.Value{}, ret[1].Interface().(error)
+		}
+		if ret[0].IsNil() {
+			return 0, reflect.Value{}, errors.New("aggregator constructor returned nil state")
+		}
+		ai.next++
+		ai.active[*aggIdx] = ret[0]
+	}
+	return *aggIdx, ai.active[*aggIdx], nil
+}
+
+func (ai *aggInfo) Step(ctx *C.sqlite3_context, argv []*C.sqlite3_value) {
+	_, agg, err := ai.agg(ctx)
+	if err != nil {
+		callbackError(ctx, err)
+		return
+	}
+
+	args, err := callbackConvertArgs(argv, ai.stepArgConverters, ai.stepVariadicConverter)
+	if err != nil {
+		callbackError(ctx, err)
+		return
+	}
+
+	ret := agg.MethodByName("Step").Call(args)
+	if len(ret) == 1 && ret[0].Interface() != nil {
+		callbackError(ctx, ret[0].Interface().(error))
+		return
+	}
+}
+
+func (ai *aggInfo) Done(ctx *C.sqlite3_context) {
+	idx, agg, err := ai.agg(ctx)
+	if err != nil {
+		callbackError(ctx, err)
+		return
+	}
+	defer func() { delete(ai.active, idx) }()
+
+	ret := agg.MethodByName("Done").Call(nil)
+	if len(ret) == 2 && ret[1].Interface() != nil {
+		callbackError(ctx, ret[1].Interface().(error))
+		return
+	}
+
+	err = ai.doneRetConverter(ctx, ret[0])
+	if err != nil {
+		callbackError(ctx, err)
+		return
+	}
 }
 
 // Commit transaction.
@@ -179,6 +351,280 @@ func (tx *SQLiteTx) Commit() error {
 func (tx *SQLiteTx) Rollback() error {
 	_, err := tx.c.exec(context.Background(), "ROLLBACK", nil)
 	return err
+}
+
+// RegisterCollation makes a Go function available as a collation.
+//
+// cmp receives two UTF-8 strings, a and b. The result should be 0 if
+// a==b, -1 if a < b, and +1 if a > b.
+//
+// cmp must always return the same result given the same
+// inputs. Additionally, it must have the following properties for all
+// strings A, B and C: if A==B then B==A; if A==B and B==C then A==C;
+// if A<B then B>A; if A<B and B<C then A<C.
+//
+// If cmp does not obey these constraints, sqlite3's behavior is
+// undefined when the collation is used.
+func (c *SQLiteConn) RegisterCollation(name string, cmp func(string, string) int) error {
+	handle := newHandle(c, cmp)
+	cname := C.CString(name)
+	defer C.free(unsafe.Pointer(cname))
+	rv := C.sqlite3_create_collation(c.db, cname, C.SQLITE_UTF8, unsafe.Pointer(handle), (*[0]byte)(unsafe.Pointer(C.compareTrampoline)))
+	if rv != C.SQLITE_OK {
+		return c.lastError()
+	}
+	return nil
+}
+
+// RegisterCommitHook sets the commit hook for a connection.
+//
+// If the callback returns non-zero the transaction will become a rollback.
+//
+// If there is an existing commit hook for this connection, it will be
+// removed. If callback is nil the existing hook (if any) will be removed
+// without creating a new one.
+func (c *SQLiteConn) RegisterCommitHook(callback func() int) {
+	if callback == nil {
+		C.sqlite3_commit_hook(c.db, nil, nil)
+	} else {
+		C.sqlite3_commit_hook(c.db, (*[0]byte)(unsafe.Pointer(C.commitHookTrampoline)), unsafe.Pointer(newHandle(c, callback)))
+	}
+}
+
+// RegisterRollbackHook sets the rollback hook for a connection.
+//
+// If there is an existing rollback hook for this connection, it will be
+// removed. If callback is nil the existing hook (if any) will be removed
+// without creating a new one.
+func (c *SQLiteConn) RegisterRollbackHook(callback func()) {
+	if callback == nil {
+		C.sqlite3_rollback_hook(c.db, nil, nil)
+	} else {
+		C.sqlite3_rollback_hook(c.db, (*[0]byte)(unsafe.Pointer(C.rollbackHookTrampoline)), unsafe.Pointer(newHandle(c, callback)))
+	}
+}
+
+// RegisterUpdateHook sets the update hook for a connection.
+//
+// The parameters to the callback are the operation (one of the constants
+// SQLITE_INSERT, SQLITE_DELETE, or SQLITE_UPDATE), the database name, the
+// table name, and the rowid.
+//
+// If there is an existing update hook for this connection, it will be
+// removed. If callback is nil the existing hook (if any) will be removed
+// without creating a new one.
+func (c *SQLiteConn) RegisterUpdateHook(callback func(int, string, string, int64)) {
+	if callback == nil {
+		C.sqlite3_update_hook(c.db, nil, nil)
+	} else {
+		C.sqlite3_update_hook(c.db, (*[0]byte)(unsafe.Pointer(C.updateHookTrampoline)), unsafe.Pointer(newHandle(c, callback)))
+	}
+}
+
+// RegisterFunc makes a Go function available as a SQLite function.
+//
+// The Go function can have arguments of the following types: any
+// numeric type except complex, bool, []byte, string and
+// interface{}. interface{} arguments are given the direct translation
+// of the SQLite data type: int64 for INTEGER, float64 for FLOAT,
+// []byte for BLOB, string for TEXT.
+//
+// The function can additionally be variadic, as long as the type of
+// the variadic argument is one of the above.
+//
+// If pure is true. SQLite will assume that the function's return
+// value depends only on its inputs, and make more aggressive
+// optimizations in its queries.
+//
+// See _example/go_custom_funcs for a detailed example.
+func (c *SQLiteConn) RegisterFunc(name string, impl interface{}, pure bool) error {
+	var fi functionInfo
+	fi.f = reflect.ValueOf(impl)
+	t := fi.f.Type()
+	if t.Kind() != reflect.Func {
+		return errors.New("Non-function passed to RegisterFunc")
+	}
+	if t.NumOut() != 1 && t.NumOut() != 2 {
+		return errors.New("SQLite functions must return 1 or 2 values")
+	}
+	if t.NumOut() == 2 && !t.Out(1).Implements(reflect.TypeOf((*error)(nil)).Elem()) {
+		return errors.New("Second return value of SQLite function must be error")
+	}
+
+	numArgs := t.NumIn()
+	if t.IsVariadic() {
+		numArgs--
+	}
+
+	for i := 0; i < numArgs; i++ {
+		conv, err := callbackArg(t.In(i))
+		if err != nil {
+			return err
+		}
+		fi.argConverters = append(fi.argConverters, conv)
+	}
+
+	if t.IsVariadic() {
+		conv, err := callbackArg(t.In(numArgs).Elem())
+		if err != nil {
+			return err
+		}
+		fi.variadicConverter = conv
+		// Pass -1 to sqlite so that it allows any number of
+		// arguments. The call helper verifies that the minimum number
+		// of arguments is present for variadic functions.
+		numArgs = -1
+	}
+
+	conv, err := callbackRet(t.Out(0))
+	if err != nil {
+		return err
+	}
+	fi.retConverter = conv
+
+	// fi must outlast the database connection, or we'll have dangling pointers.
+	c.funcs = append(c.funcs, &fi)
+
+	cname := C.CString(name)
+	defer C.free(unsafe.Pointer(cname))
+	opts := C.SQLITE_UTF8
+	if pure {
+		opts |= C.SQLITE_DETERMINISTIC
+	}
+	rv := sqlite3CreateFunction(c.db, cname, C.int(numArgs), C.int(opts), newHandle(c, &fi), C.callbackTrampoline, nil, nil)
+	if rv != C.SQLITE_OK {
+		return c.lastError()
+	}
+	return nil
+}
+
+func sqlite3CreateFunction(db *C.sqlite3, zFunctionName *C.char, nArg C.int, eTextRep C.int, pApp uintptr, xFunc unsafe.Pointer, xStep unsafe.Pointer, xFinal unsafe.Pointer) C.int {
+	return C._sqlite3_create_function(db, zFunctionName, nArg, eTextRep, C.uintptr_t(pApp), (*[0]byte)(unsafe.Pointer(xFunc)), (*[0]byte)(unsafe.Pointer(xStep)), (*[0]byte)(unsafe.Pointer(xFinal)))
+}
+
+// RegisterAggregator makes a Go type available as a SQLite aggregation function.
+//
+// Because aggregation is incremental, it's implemented in Go with a
+// type that has 2 methods: func Step(values) accumulates one row of
+// data into the accumulator, and func Done() ret finalizes and
+// returns the aggregate value. "values" and "ret" may be any type
+// supported by RegisterFunc.
+//
+// RegisterAggregator takes as implementation a constructor function
+// that constructs an instance of the aggregator type each time an
+// aggregation begins. The constructor must return a pointer to a
+// type, or an interface that implements Step() and Done().
+//
+// The constructor function and the Step/Done methods may optionally
+// return an error in addition to their other return values.
+//
+// See _example/go_custom_funcs for a detailed example.
+func (c *SQLiteConn) RegisterAggregator(name string, impl interface{}, pure bool) error {
+	var ai aggInfo
+	ai.constructor = reflect.ValueOf(impl)
+	t := ai.constructor.Type()
+	if t.Kind() != reflect.Func {
+		return errors.New("non-function passed to RegisterAggregator")
+	}
+	if t.NumOut() != 1 && t.NumOut() != 2 {
+		return errors.New("SQLite aggregator constructors must return 1 or 2 values")
+	}
+	if t.NumOut() == 2 && !t.Out(1).Implements(reflect.TypeOf((*error)(nil)).Elem()) {
+		return errors.New("Second return value of SQLite function must be error")
+	}
+	if t.NumIn() != 0 {
+		return errors.New("SQLite aggregator constructors must not have arguments")
+	}
+
+	agg := t.Out(0)
+	switch agg.Kind() {
+	case reflect.Ptr, reflect.Interface:
+	default:
+		return errors.New("SQlite aggregator constructor must return a pointer object")
+	}
+	stepFn, found := agg.MethodByName("Step")
+	if !found {
+		return errors.New("SQlite aggregator doesn't have a Step() function")
+	}
+	step := stepFn.Type
+	if step.NumOut() != 0 && step.NumOut() != 1 {
+		return errors.New("SQlite aggregator Step() function must return 0 or 1 values")
+	}
+	if step.NumOut() == 1 && !step.Out(0).Implements(reflect.TypeOf((*error)(nil)).Elem()) {
+		return errors.New("type of SQlite aggregator Step() return value must be error")
+	}
+
+	stepNArgs := step.NumIn()
+	start := 0
+	if agg.Kind() == reflect.Ptr {
+		// Skip over the method receiver
+		stepNArgs--
+		start++
+	}
+	if step.IsVariadic() {
+		stepNArgs--
+	}
+	for i := start; i < start+stepNArgs; i++ {
+		conv, err := callbackArg(step.In(i))
+		if err != nil {
+			return err
+		}
+		ai.stepArgConverters = append(ai.stepArgConverters, conv)
+	}
+	if step.IsVariadic() {
+		conv, err := callbackArg(t.In(start + stepNArgs).Elem())
+		if err != nil {
+			return err
+		}
+		ai.stepVariadicConverter = conv
+		// Pass -1 to sqlite so that it allows any number of
+		// arguments. The call helper verifies that the minimum number
+		// of arguments is present for variadic functions.
+		stepNArgs = -1
+	}
+
+	doneFn, found := agg.MethodByName("Done")
+	if !found {
+		return errors.New("SQlite aggregator doesn't have a Done() function")
+	}
+	done := doneFn.Type
+	doneNArgs := done.NumIn()
+	if agg.Kind() == reflect.Ptr {
+		// Skip over the method receiver
+		doneNArgs--
+	}
+	if doneNArgs != 0 {
+		return errors.New("SQlite aggregator Done() function must have no arguments")
+	}
+	if done.NumOut() != 1 && done.NumOut() != 2 {
+		return errors.New("SQLite aggregator Done() function must return 1 or 2 values")
+	}
+	if done.NumOut() == 2 && !done.Out(1).Implements(reflect.TypeOf((*error)(nil)).Elem()) {
+		return errors.New("second return value of SQLite aggregator Done() function must be error")
+	}
+
+	conv, err := callbackRet(done.Out(0))
+	if err != nil {
+		return err
+	}
+	ai.doneRetConverter = conv
+	ai.active = make(map[int64]reflect.Value)
+	ai.next = 1
+
+	// ai must outlast the database connection, or we'll have dangling pointers.
+	c.aggregators = append(c.aggregators, &ai)
+
+	cname := C.CString(name)
+	defer C.free(unsafe.Pointer(cname))
+	opts := C.SQLITE_UTF8
+	if pure {
+		opts |= C.SQLITE_DETERMINISTIC
+	}
+	rv := sqlite3CreateFunction(c.db, cname, C.int(stepNArgs), C.int(opts), newHandle(c, &ai), nil, C.stepTrampoline, C.doneTrampoline)
+	if rv != C.SQLITE_OK {
+		return c.lastError()
+	}
+	return nil
 }
 
 // AutoCommit return which currently auto commit or not.
@@ -330,6 +776,8 @@ func errorString(err Error) string {
 //     "deferred", "exclusive".
 //   _foreign_keys=X
 //     Enable or disable enforcement of foreign keys.  X can be 1 or 0.
+//   _recursive_triggers=X
+//     Enable or disable recursive triggers.  X can be 1 or 0.
 // go-sqlcipher adds the following query parameters to those used by SQLite:
 //   _pragma_key=XXX
 //     Specify PRAGMA key.
@@ -344,6 +792,7 @@ func (d *SQLiteDriver) Open(dsn string) (driver.Conn, error) {
 	txlock := "BEGIN"
 	busyTimeout := 5000
 	foreignKeys := -1
+	recursiveTriggers := -1
 	pos := strings.IndexRune(dsn, '?')
 	var params url.Values
 	if pos >= 1 {
@@ -400,6 +849,18 @@ func (d *SQLiteDriver) Open(dsn string) (driver.Conn, error) {
 			}
 		}
 
+		// _recursive_triggers
+		if val := params.Get("_recursive_triggers"); val != "" {
+			switch val {
+			case "1":
+				recursiveTriggers = 1
+			case "0":
+				recursiveTriggers = 0
+			default:
+				return nil, fmt.Errorf("Invalid _recursive_triggers: %v", val)
+			}
+		}
+
 		if !strings.HasPrefix(dsn, "file:") {
 			dsn = dsn[:pos]
 		}
@@ -409,7 +870,7 @@ func (d *SQLiteDriver) Open(dsn string) (driver.Conn, error) {
 	name := C.CString(dsn)
 	defer C.free(unsafe.Pointer(name))
 	rv := C._sqlite3_open_v2(name, &db,
-		C.SQLITE_OPEN_NOMUTEX|
+		C.SQLITE_OPEN_FULLMUTEX|
 			C.SQLITE_OPEN_READWRITE|
 			C.SQLITE_OPEN_CREATE,
 		nil)
@@ -442,6 +903,17 @@ func (d *SQLiteDriver) Open(dsn string) (driver.Conn, error) {
 		}
 	} else if foreignKeys == 1 {
 		if err := exec("PRAGMA foreign_keys = ON;"); err != nil {
+			C.sqlite3_close_v2(db)
+			return nil, err
+		}
+	}
+	if recursiveTriggers == 0 {
+		if err := exec("PRAGMA recursive_triggers = OFF;"); err != nil {
+			C.sqlite3_close_v2(db)
+			return nil, err
+		}
+	} else if recursiveTriggers == 1 {
+		if err := exec("PRAGMA recursive_triggers = ON;"); err != nil {
 			C.sqlite3_close_v2(db)
 			return nil, err
 		}
@@ -487,9 +959,21 @@ func (c *SQLiteConn) Close() error {
 	if rv != C.SQLITE_OK {
 		return c.lastError()
 	}
+	deleteHandles(c)
+	c.mu.Lock()
 	c.db = nil
+	c.mu.Unlock()
 	runtime.SetFinalizer(c, nil)
 	return nil
+}
+
+func (c *SQLiteConn) dbConnOpen() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.db != nil
 }
 
 // Prepare the query string. Return a new statement.
@@ -515,16 +999,49 @@ func (c *SQLiteConn) prepare(ctx context.Context, query string) (driver.Stmt, er
 	return ss, nil
 }
 
+// Run-Time Limit Categories.
+// See: http://www.sqlite.org/c3ref/c_limit_attached.html
+const (
+	SQLITE_LIMIT_LENGTH              = C.SQLITE_LIMIT_LENGTH
+	SQLITE_LIMIT_SQL_LENGTH          = C.SQLITE_LIMIT_SQL_LENGTH
+	SQLITE_LIMIT_COLUMN              = C.SQLITE_LIMIT_COLUMN
+	SQLITE_LIMIT_EXPR_DEPTH          = C.SQLITE_LIMIT_EXPR_DEPTH
+	SQLITE_LIMIT_COMPOUND_SELECT     = C.SQLITE_LIMIT_COMPOUND_SELECT
+	SQLITE_LIMIT_VDBE_OP             = C.SQLITE_LIMIT_VDBE_OP
+	SQLITE_LIMIT_FUNCTION_ARG        = C.SQLITE_LIMIT_FUNCTION_ARG
+	SQLITE_LIMIT_ATTACHED            = C.SQLITE_LIMIT_ATTACHED
+	SQLITE_LIMIT_LIKE_PATTERN_LENGTH = C.SQLITE_LIMIT_LIKE_PATTERN_LENGTH
+	SQLITE_LIMIT_VARIABLE_NUMBER     = C.SQLITE_LIMIT_VARIABLE_NUMBER
+	SQLITE_LIMIT_TRIGGER_DEPTH       = C.SQLITE_LIMIT_TRIGGER_DEPTH
+	SQLITE_LIMIT_WORKER_THREADS      = C.SQLITE_LIMIT_WORKER_THREADS
+)
+
+// GetLimit returns the current value of a run-time limit.
+// See: sqlite3_limit, http://www.sqlite.org/c3ref/limit.html
+func (c *SQLiteConn) GetLimit(id int) int {
+	return int(C._sqlite3_limit(c.db, C.int(id), -1))
+}
+
+// SetLimit changes the value of a run-time limits.
+// Then this method returns the prior value of the limit.
+// See: sqlite3_limit, http://www.sqlite.org/c3ref/limit.html
+func (c *SQLiteConn) SetLimit(id int, newVal int) int {
+	return int(C._sqlite3_limit(c.db, C.int(id), C.int(newVal)))
+}
+
 // Close the statement.
 func (s *SQLiteStmt) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.closed {
 		return nil
 	}
 	s.closed = true
-	if s.c == nil || s.c.db == nil {
+	if !s.c.dbConnOpen() {
 		return errors.New("sqlite statement with already closed database connection")
 	}
 	rv := C.sqlite3_finalize(s.s)
+	s.s = nil
 	if rv != C.SQLITE_OK {
 		return s.c.lastError()
 	}
@@ -541,6 +1058,8 @@ type bindArg struct {
 	n int
 	v driver.Value
 }
+
+var placeHolder = []byte{0}
 
 func (s *SQLiteStmt) bind(args []namedValue) error {
 	rv := C.sqlite3_reset(s.s)
@@ -563,8 +1082,7 @@ func (s *SQLiteStmt) bind(args []namedValue) error {
 			rv = C.sqlite3_bind_null(s.s, n)
 		case string:
 			if len(v) == 0 {
-				b := []byte{0}
-				rv = C._sqlite3_bind_text(s.s, n, (*C.char)(unsafe.Pointer(&b[0])), C.int(0))
+				rv = C._sqlite3_bind_text(s.s, n, (*C.char)(unsafe.Pointer(&placeHolder[0])), C.int(0))
 			} else {
 				b := []byte(v)
 				rv = C._sqlite3_bind_text(s.s, n, (*C.char)(unsafe.Pointer(&b[0])), C.int(len(b)))
@@ -580,11 +1098,11 @@ func (s *SQLiteStmt) bind(args []namedValue) error {
 		case float64:
 			rv = C.sqlite3_bind_double(s.s, n, C.double(v))
 		case []byte:
-			if len(v) == 0 {
-				rv = C._sqlite3_bind_blob(s.s, n, nil, 0)
-			} else {
-				rv = C._sqlite3_bind_blob(s.s, n, unsafe.Pointer(&v[0]), C.int(len(v)))
+			ln := len(v)
+			if ln == 0 {
+				v = placeHolder
 			}
+			rv = C._sqlite3_bind_blob(s.s, n, unsafe.Pointer(&v[0]), C.int(ln))
 		case time.Time:
 			b := []byte(v.Format(SQLiteTimestampFormats[0]))
 			rv = C._sqlite3_bind_text(s.s, n, (*C.char)(unsafe.Pointer(&b[0])), C.int(len(b)))
@@ -619,21 +1137,24 @@ func (s *SQLiteStmt) query(ctx context.Context, args []namedValue) (driver.Rows,
 		cols:     nil,
 		decltype: nil,
 		cls:      s.cls,
+		closed:   false,
 		done:     make(chan struct{}),
 	}
 
-	go func(db *C.sqlite3) {
-		select {
-		case <-ctx.Done():
+	if ctxdone := ctx.Done(); ctxdone != nil {
+		go func(db *C.sqlite3) {
 			select {
+			case <-ctxdone:
+				select {
+				case <-rows.done:
+				default:
+					C.sqlite3_interrupt(db)
+					rows.Close()
+				}
 			case <-rows.done:
-			default:
-				C.sqlite3_interrupt(db)
-				rows.Close()
 			}
-		case <-rows.done:
-		}
-	}(s.c.db)
+		}(s.c.db)
+	}
 
 	return rows, nil
 }
@@ -667,15 +1188,21 @@ func (s *SQLiteStmt) exec(ctx context.Context, args []namedValue) (driver.Result
 		return nil, err
 	}
 
-	done := make(chan struct{})
-	defer close(done)
-	go func(db *C.sqlite3) {
-		select {
-		case <-ctx.Done():
-			C.sqlite3_interrupt(db)
-		case <-done:
-		}
-	}(s.c.db)
+	if ctxdone := ctx.Done(); ctxdone != nil {
+		done := make(chan struct{})
+		defer close(done)
+		go func(db *C.sqlite3) {
+			select {
+			case <-done:
+			case <-ctxdone:
+				select {
+				case <-done:
+				default:
+					C.sqlite3_interrupt(db)
+				}
+			}
+		}(s.c.db)
+	}
 
 	var rowid, changes C.longlong
 	rv := C._sqlite3_step(s.s, &rowid, &changes)
@@ -691,25 +1218,33 @@ func (s *SQLiteStmt) exec(ctx context.Context, args []namedValue) (driver.Result
 
 // Close the rows.
 func (rc *SQLiteRows) Close() error {
-	if rc.s.closed {
+	rc.s.mu.Lock()
+	if rc.s.closed || rc.closed {
+		rc.s.mu.Unlock()
 		return nil
 	}
+	rc.closed = true
 	if rc.done != nil {
 		close(rc.done)
 	}
 	if rc.cls {
+		rc.s.mu.Unlock()
 		return rc.s.Close()
 	}
 	rv := C.sqlite3_reset(rc.s.s)
 	if rv != C.SQLITE_OK {
+		rc.s.mu.Unlock()
 		return rc.s.c.lastError()
 	}
+	rc.s.mu.Unlock()
 	return nil
 }
 
 // Columns return column names.
 func (rc *SQLiteRows) Columns() []string {
-	if rc.nc != len(rc.cols) {
+	rc.s.mu.Lock()
+	defer rc.s.mu.Unlock()
+	if rc.s.s != nil && rc.nc != len(rc.cols) {
 		rc.cols = make([]string, rc.nc)
 		for i := 0; i < rc.nc; i++ {
 			rc.cols[i] = C.GoString(C.sqlite3_column_name(rc.s.s, C.int(i)))
@@ -718,9 +1253,8 @@ func (rc *SQLiteRows) Columns() []string {
 	return rc.cols
 }
 
-// DeclTypes return column types.
-func (rc *SQLiteRows) DeclTypes() []string {
-	if rc.decltype == nil {
+func (rc *SQLiteRows) declTypes() []string {
+	if rc.s.s != nil && rc.decltype == nil {
 		rc.decltype = make([]string, rc.nc)
 		for i := 0; i < rc.nc; i++ {
 			rc.decltype[i] = strings.ToLower(C.GoString(C.sqlite3_column_decltype(rc.s.s, C.int(i))))
@@ -729,13 +1263,20 @@ func (rc *SQLiteRows) DeclTypes() []string {
 	return rc.decltype
 }
 
-func (rc *SQLiteRows) ColumnTypeDatabaseTypeName(index int) string {
-	typs := rc.DeclTypes()
-	return typs[index]
+// DeclTypes return column types.
+func (rc *SQLiteRows) DeclTypes() []string {
+	rc.s.mu.Lock()
+	defer rc.s.mu.Unlock()
+	return rc.declTypes()
 }
 
 // Next move cursor to next.
 func (rc *SQLiteRows) Next(dest []driver.Value) error {
+	if rc.s.closed {
+		return io.EOF
+	}
+	rc.s.mu.Lock()
+	defer rc.s.mu.Unlock()
 	rv := C.sqlite3_step(rc.s.s)
 	if rv == C.SQLITE_DONE {
 		return io.EOF
@@ -748,7 +1289,7 @@ func (rc *SQLiteRows) Next(dest []driver.Value) error {
 		return nil
 	}
 
-	rc.DeclTypes()
+	rc.declTypes()
 
 	for i := range dest {
 		switch C.sqlite3_column_type(rc.s.s, C.int(i)) {
@@ -761,10 +1302,11 @@ func (rc *SQLiteRows) Next(dest []driver.Value) error {
 				// large to be a reasonable timestamp in seconds.
 				if val > 1e12 || val < -1e12 {
 					val *= int64(time.Millisecond) // convert ms to nsec
+					t = time.Unix(0, val)
 				} else {
-					val *= int64(time.Second) // convert sec to nsec
+					t = time.Unix(val, 0)
 				}
-				t = time.Unix(0, val).UTC()
+				t = t.UTC()
 				if rc.s.c.loc != nil {
 					t = t.In(rc.s.c.loc)
 				}
